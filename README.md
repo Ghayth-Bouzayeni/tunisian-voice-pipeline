@@ -20,7 +20,7 @@ A **public speech-to-text API** designed for the **Tunisian Arabic dialect**, ag
 
 ## 🧱 Architecture Overview
 
-![API Swagger](images/swagger.png)  
+![API Swagger](images/swager.png)  
 *Swagger interface of the public API.*
 
 ![Admin Dashboard](images/dash.png)  
