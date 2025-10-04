@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openresty-proxy
+  labels:
+    app: openresty-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openresty-proxy
+  template:
+    metadata:
+      labels:
+        app: openresty-proxy
+    spec:
+      containers:
+      - name: openresty
+        image: openresty/openresty:alpine
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: openresty-config
+          mountPath: /usr/local/openresty/nginx/conf/nginx.conf
+          subPath: nginx.conf
+      volumes:
+      - name: openresty-config
+        configMap:
+          name: openresty-config

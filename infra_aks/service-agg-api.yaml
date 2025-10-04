@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agg-api-service
+spec:
+  selector:
+    app: agg-api
+  ports:
+    - port: 9000
+      targetPort: 9000
+  type: ClusterIP

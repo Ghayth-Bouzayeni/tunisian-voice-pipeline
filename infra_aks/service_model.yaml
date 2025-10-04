@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: whisper-jdide-service
+spec:
+  selector:
+    app: whisper-jdide
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whisper-medium-service
+spec:
+  selector:
+    app: whisper-medium-api
+  ports:
+    - protocol: TCP
+      port: 7000
+      targetPort: 7000
+  type: ClusterIP

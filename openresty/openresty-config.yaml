@@ -1,0 +1,297 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openresty-config
+data:
+  nginx.conf: |
+    worker_processes 1;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        
+        client_max_body_size 50M;
+
+        lua_package_path "/usr/local/openresty/lualib/?.lua;;";
+        resolver 10.0.0.10 ipv6=off;
+        resolver_timeout 5s;
+
+
+
+        upstream agg_api_backend {
+            server agg-api-service:9000;
+        }
+
+        server {
+            listen 8080;
+
+            # Swagger UI et openapi.json
+            location /docs {
+                proxy_pass http://agg_api_backend;
+            }
+
+            location /openapi.json {
+                proxy_pass http://agg_api_backend;
+            }
+
+            # Endpoint POST /transcript
+            location /transcript {
+                # 1) Configuration pour le body
+                client_body_in_file_only on;
+                client_body_temp_path /tmp 1 2;
+                client_body_buffer_size 50M;
+
+                # 2) Extraction et upload audio vers Azure Blob
+                access_by_lua_block {
+                    local function safe_execute()
+                        -- Forcer la lecture du body
+                        ngx.req.read_body()
+                        
+                        local content_type = ngx.var.content_type or ""
+                        local ts = tostring(math.floor(ngx.now() * 1000))
+                        
+                        -- Stocker l'ID de requête dans le contexte
+                        ngx.ctx.request_id = ts
+                        
+                        -- Fonction pour extraire l'audio du multipart
+                        local function extract_audio_from_multipart(data, boundary)
+                            if not data or not boundary then
+                                return nil
+                            end
+                            
+                            local start = 1
+                            while true do
+                                local part_start = string.find(data, "--" .. boundary, start)
+                                if not part_start then break end
+                                
+                                local part_end = string.find(data, "--" .. boundary, part_start + 1)
+                                if not part_end then
+                                    part_end = #data
+                                end
+                                
+                                local part = string.sub(data, part_start, part_end - 1)
+                                local headers_end = string.find(part, "\r?\n\r?\n")
+                                
+                                if headers_end then
+                                    local headers = string.sub(part, 1, headers_end)
+                                    local body = string.sub(part, headers_end + 4)
+                                    
+                                    if headers and body and #body > 100 then
+                                        local headers_lower = string.lower(headers)
+                                        if string.find(headers_lower, "content%-type:%s*audio") or
+                                           string.find(headers_lower, 'filename="[^"]*%.wav"') or
+                                           string.find(headers_lower, 'filename="[^"]*%.mp3"') then
+                                            return body
+                                        end
+                                    end
+                                end
+                                
+                                start = part_end
+                            end
+                            
+                            return nil
+                        end
+                        
+                        local audio_data = nil
+                        
+                        -- Traiter selon le Content-Type
+                        if string.find(content_type, "multipart/form%-data") then
+                            local boundary = string.match(content_type, "boundary=([^;%s]+)")
+                            if boundary then
+                                boundary = string.gsub(boundary, "^[\"']", "")
+                                boundary = string.gsub(boundary, "[\"']$", "")
+                                
+                                local body_file = ngx.var.request_body_file
+                                local full_data = nil
+                                
+                                if body_file then
+                                    local infile = io.open(body_file, "rb")
+                                    if infile then
+                                        full_data = infile:read("*a")
+                                        infile:close()
+                                    end
+                                else
+                                    full_data = ngx.req.get_body_data()
+                                end
+                                
+                                if full_data and #full_data > 0 then
+                                    audio_data = extract_audio_from_multipart(full_data, boundary)
+                                    if audio_data then
+                                        ngx.log(ngx.ERR, "[DEBUG] Audio extrait: ", #audio_data, " bytes")
+                                    end
+                                end
+                            end
+                            
+                        elseif string.find(content_type, "audio/") or 
+                               string.find(content_type, "application/octet%-stream") then
+                            local body_file = ngx.var.request_body_file
+                            if body_file then
+                                local infile = io.open(body_file, "rb")
+                                if infile then
+                                    audio_data = infile:read("*a")
+                                    infile:close()
+                                end
+                            else
+                                audio_data = ngx.req.get_body_data()
+                            end
+                        end
+                        
+                        -- Upload audio vers Azure Blob de manière ASYNCHRONE
+                        if audio_data and #audio_data > 0 then
+                            local blob_name = "audio_" .. ts .. ".wav"
+                            local audio_copy = audio_data  -- Copie pour le timer
+                            
+                            -- Upload asynchrone via timer (ne bloque pas la requête)
+                            local ok, err = ngx.timer.at(0, function(premature)
+                                if premature then return end
+                                
+                                local storage_account = "mystorageacct2025xyz123"
+                                local container = "datasets"
+                                local sas_token = "se=2025-12-31T23%3A59%3A00Z&sp=rwl&spr=https&sv=2022-11-02&sr=c&sig=kQ8cNWalve2z3dJFZXwL71Xysi/xyQj17yi9LJ6VPuA%3D"
+                                
+                                local url = string.format(
+                                    "https://%s.blob.core.windows.net/%s/%s?%s",
+                                    storage_account,
+                                    container,
+                                    blob_name,
+                                    sas_token
+                                )
+                                
+                                local httpc = require("resty.http").new()
+                                httpc:set_timeout(30000)
+                                
+                                local res, err = httpc:request_uri(url, {
+                                    method = "PUT",
+                                    body = audio_copy,
+                                    headers = {
+                                        ["Content-Type"] = "audio/wav",
+                                        ["x-ms-blob-type"] = "BlockBlob",
+                                        ["Content-Length"] = tostring(#audio_copy)
+                                    },
+                                    resolver = {"10.0.0.10"},
+                                    ssl_verify = false
+                                })
+                                
+                                if not res then
+                                    ngx.log(ngx.ERR, "[ERROR] Upload audio échoué: ", err)
+                                elseif res.status >= 200 and res.status < 300 then
+                                    ngx.log(ngx.ERR, "[DEBUG] Upload audio réussi: ", blob_name, " (", #audio_copy, " bytes)")
+                                else
+                                    ngx.log(ngx.ERR, "[ERROR] Azure Blob erreur ", res.status, ": ", res.body)
+                                end
+                            end)
+                            
+                            if not ok then
+                                ngx.log(ngx.ERR, "[ERROR] Impossible de créer le timer pour l'audio: ", err)
+                            else
+                                ngx.log(ngx.ERR, "[DEBUG] Upload audio planifié en arrière-plan")
+                            end
+                        else
+                            ngx.log(ngx.ERR, "[DEBUG] Aucun audio à uploader")
+                        end
+                    end
+                    
+                    local success, err = pcall(safe_execute)
+                    if not success then
+                        ngx.log(ngx.ERR, "[ERROR] Erreur dans access_by_lua_block: ", err)
+                    end
+                }
+
+                # 3) Upload de la réponse vers Azure Blob
+                body_filter_by_lua_block {
+                    local function safe_response_filter()
+                        local request_id = ngx.ctx.request_id
+                        
+                        if request_id then
+                            -- Accumuler la réponse
+                            if not ngx.ctx.response_body then
+                                ngx.ctx.response_body = ""
+                            end
+                            if ngx.arg[1] then
+                                ngx.ctx.response_body = ngx.ctx.response_body .. ngx.arg[1]
+                            end
+                            
+                            -- Si c'est le dernier chunk, planifier l'upload
+                            if ngx.arg[2] then
+                                if ngx.ctx.response_body and #ngx.ctx.response_body > 0 then
+                                    local response_data = ngx.ctx.response_body
+                                    local blob_name = "response_" .. request_id .. ".json"
+                                    
+                                    -- Upload asynchrone via timer
+                                    local ok, err = ngx.timer.at(0, function(premature)
+                                        if premature then return end
+                                        
+                                        local storage_account = "mystorageacct2025xyz123"
+                                        local container = "datasets"
+                                        local sas_token = "se=2025-12-31T23%3A59%3A00Z&sp=rwl&spr=https&sv=2022-11-02&sr=c&sig=kQ8cNWalve2z3dJFZXwL71Xysi/xyQj17yi9LJ6VPuA%3D"
+                                        
+                                        local url = string.format(
+                                            "https://%s.blob.core.windows.net/%s/%s?%s",
+                                            storage_account,
+                                            container,
+                                            blob_name,
+                                            sas_token
+                                        )
+                                        
+                                        local httpc = require("resty.http").new()
+                                        httpc:set_timeout(30000)
+                                        
+                                        local res, err = httpc:request_uri(url, {
+                                            method = "PUT",
+                                            body = response_data,
+                                            headers = {
+                                                ["Content-Type"] = "application/json",
+                                                ["x-ms-blob-type"] = "BlockBlob",
+                                                ["Content-Length"] = tostring(#response_data)
+                                            },
+                                            ssl_verify = false
+                                        })
+                                        
+                                        if not res then
+                                            ngx.log(ngx.ERR, "[ERROR] Upload réponse échoué: ", err)
+                                        elseif res.status >= 200 and res.status < 300 then
+                                            ngx.log(ngx.ERR, "[DEBUG] Upload réponse réussi: ", blob_name, " (", #response_data, " bytes)")
+                                        else
+                                            ngx.log(ngx.ERR, "[ERROR] Azure Blob erreur ", res.status, ": ", res.body)
+                                        end
+                                    end)
+                                    
+                                    if not ok then
+                                        ngx.log(ngx.ERR, "[ERROR] Impossible de créer le timer: ", err)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    
+                    local success, err = pcall(safe_response_filter)
+                    if not success then
+                        ngx.log(ngx.ERR, "[ERROR] Erreur dans body_filter_by_lua_block: ", err)
+                    end
+                }
+
+                # 4) Forward vers backend
+                proxy_pass http://agg_api_backend/transcript;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+
+                proxy_connect_timeout 600s;
+                proxy_send_timeout 600s;
+                proxy_read_timeout 600s;
+                send_timeout 600s;
+            }
+
+            # Proxy normal pour toutes les autres requêtes
+            location / {
+                proxy_pass http://agg_api_backend;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+        }
+    }

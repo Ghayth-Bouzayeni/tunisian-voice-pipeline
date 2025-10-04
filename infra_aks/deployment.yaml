@@ -1,0 +1,115 @@
+# ============================
+# Deployment + Service : whisper-jdide
+# ============================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisper-jdide
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whisper-jdide
+  template:
+    metadata:
+      labels:
+        app: whisper-jdide
+    spec:
+      containers:
+        - name: whisper-jdide
+          image: ghaythbz/whisper-jdide:latest   
+          imagePullPolicy: Always                
+          ports:
+            - containerPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whisper-jdide-service
+spec:
+  selector:
+    app: whisper-jdide
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP   # interne au cluster
+
+# ============================
+# Deployment + Service : whisper-medium-api
+# ============================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisper-medium-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whisper-medium-api
+  template:
+    metadata:
+      labels:
+        app: whisper-medium-api
+    spec:
+      containers:
+        - name: whisper-medium-api
+          image: ghaythbz/whisper-medium-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 7000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whisper-medium-service
+spec:
+  selector:
+    app: whisper-medium-api
+  ports:
+    - protocol: TCP
+      port: 7000
+      targetPort: 7000
+  type: ClusterIP   # interne au cluster
+
+# ============================
+# Deployment + Service : agg-api
+# ============================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agg-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agg-api
+  template:
+    metadata:
+      labels:
+        app: agg-api
+    spec:
+      containers:
+        - name: agg-api
+          image: ghaythbz/agg-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 9000
+          env:
+            - name: MODEL1_URL
+              value: "http://whisper-medium-service:7000/transcribe_wm"
+            - name: MODEL2_URL
+              value: "http://whisper-jdide-service:8000/transcribe_ws"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agg-api-service
+spec:
+  selector:
+    app: agg-api
+  ports:
+    - protocol: TCP
+      port: 9000
+      targetPort: 9000
+  type: LoadBalancer   # 👈 IP publique sur Azure
